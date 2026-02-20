@@ -1,0 +1,478 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+    <title>GPGPU Particle Repel & MediaPipe</title>
+    <style>
+        body {
+            margin: 0;
+            overflow: hidden;
+            /* Dark, moody vignette background */
+            background: radial-gradient(circle at center, #2a2a35 0%, #050508 100%);
+            font-family: sans-serif;
+            color: white;
+            touch-action: none;
+        }
+        #canvas-container {
+            position: absolute;
+            top: 0; left: 0; width: 100vw; height: 100vh;
+        }
+        video {
+            display: none; /* Hidden, only used for processing */
+        }
+        #ui {
+            position: absolute;
+            top: 50%; left: 50%;
+            transform: translate(-50%, -50%);
+            text-align: center;
+            pointer-events: none;
+            transition: opacity 0.5s ease;
+            z-index: 10;
+        }
+        .spinner {
+            width: 40px; height: 40px;
+            border: 4px solid rgba(255,255,255,0.3);
+            border-top: 4px solid #fff;
+            border-radius: 50%;
+            animation: spin 1s linear infinite;
+            margin: 0 auto 15px auto;
+        }
+        @keyframes spin { 0% { transform: rotate(0deg); } 100% { transform: rotate(360deg); } }
+    </style>
+
+    <!-- Import maps polyfill -->
+    <script async src="https://unpkg.com/es-module-shims@1.8.0/dist/es-module-shims.js"></script>
+    
+    <!-- Three.js Import Map -->
+    <script type="importmap">
+    {
+        "imports": {
+            "three": "https://unpkg.com/three@0.160.0/build/three.module.js",
+            "three/addons/": "https://unpkg.com/three@0.160.0/examples/jsm/"
+        }
+    }
+    </script>
+
+    <!-- MediaPipe Libraries -->
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands/hands.js" crossorigin="anonymous"></script>
+</head>
+<body>
+
+    <div id="ui">
+        <div class="spinner"></div>
+        <h3 id="status-text">Loading AI & GPU...<br>Please allow Camera access</h3>
+    </div>
+
+    <!-- Playsinline ensures mobile browsers don't pop out the video -->
+    <video id="webcam" autoplay playsinline></video>
+    <div id="canvas-container"></div>
+
+    <script type="module">
+        import * as THREE from 'three';
+        import { GPUComputationRenderer } from 'three/addons/misc/GPUComputationRenderer.js';
+
+        // --- CONFIGURATION ---
+        const WIDTH = 224; // 224 x 224 = 50,176 particles
+        const PARTICLES = WIDTH * WIDTH;
+        const MAX_TRACKED_POINTS = 4; // Thumb and Index finger for 2 hands
+        const TRAIL_LENGTH = 15;
+
+        // --- SCENE SETUP ---
+        const container = document.getElementById('canvas-container');
+        const scene = new THREE.Scene();
+        const camera = new THREE.PerspectiveCamera(60, window.innerWidth / window.innerHeight, 0.1, 100);
+        camera.position.z = 12;
+
+        const renderer = new THREE.WebGLRenderer({ alpha: true, antialias: true });
+        renderer.setSize(window.innerWidth, window.innerHeight);
+        renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2)); // Opt for phones
+        container.appendChild(renderer.domElement);
+
+        // --- GPGPU SHADERS ---
+        // 1. Position Update Shader
+        const computePositionShader = `
+            void main() {
+                vec2 uv = gl_FragCoord.xy / resolution.xy;
+                vec4 tmpPos = texture2D( texturePosition, uv );
+                vec3 pos = tmpPos.xyz;
+                vec4 tmpVel = texture2D( textureVelocity, uv );
+                vec3 vel = tmpVel.xyz;
+
+                // Add velocity to position
+                pos += vel * 0.016; // 60fps timestep
+
+                gl_FragColor = vec4( pos, 1.0 );
+            }
+        `;
+
+        // 2. Velocity / Physics Update Shader
+        const computeVelocityShader = `
+            uniform float time;
+            uniform vec3 uHands;
+            uniform vec3 uHandVels;
+            uniform int uHandCount;
+
+            // Simple 3D noise for floaty turbulence
+            vec3 mod289(vec3 x) { return x - floor(x * (1.0 / 289.0)) * 289.0; }
+            vec4 mod289(vec4 x) { return x - floor(x * (1.0 / 289.0)) * 289.0; }
+            vec4 permute(vec4 x) { return mod289(((x*34.0)+1.0)*x); }
+            vec4 taylorInvSqrt(vec4 r) { return 1.79284291400159 - 0.85373472095314 * r; }
+            float snoise(vec3 v) {
+                const vec2 C = vec2(1.0/6.0, 1.0/3.0);
+                const vec4 D = vec4(0.0, 0.5, 1.0, 2.0);
+                vec3 i  = floor(v + dot(v, C.yyy));
+                vec3 x0 = v - i + dot(i, C.xxx);
+                vec3 g = step(x0.yzx, x0.xyz);
+                vec3 l = 1.0 - g;
+                vec3 i1 = min(g.xyz, l.zxy);
+                vec3 i2 = max(g.xyz, l.zxy);
+                vec3 x1 = x0 - i1 + C.xxx;
+                vec3 x2 = x0 - i2 + C.yyy;
+                vec3 x3 = x0 - D.yyy;
+                i = mod289(i);
+                vec4 p = permute( permute( permute( i.z + vec4(0.0, i1.z, i2.z, 1.0 )) + i.y + vec4(0.0, i1.y, i2.y, 1.0 )) + i.x + vec4(0.0, i1.x, i2.x, 1.0 ));
+                float n_ = 0.142857142857;
+                vec3 ns = n_ * D.wyz - D.xzx;
+                vec4 j = p - 49.0 * floor(p * ns.z * ns.z);
+                vec4 x_ = floor(j * ns.z);
+                vec4 y_ = floor(j - 7.0 * x_ );
+                vec4 x = x_ *ns.x + ns.yyyy;
+                vec4 y = y_ *ns.x + ns.yyyy;
+                vec4 h = 1.0 - abs(x) - abs(y);
+                vec4 b0 = vec4( x.xy, y.xy );
+                vec4 b1 = vec4( x.zw, y.zw );
+                vec4 s0 = floor(b0)*2.0 + 1.0;
+                vec4 s1 = floor(b1)*2.0 + 1.0;
+                vec4 sh = -step(h, vec4(0.0));
+                vec4 a0 = b0.xzyw + s0.xzyw*sh.xxyy ;
+                vec4 a1 = b1.xzyw + s1.xzyw*sh.zzww ;
+                vec3 p0 = vec3(a0.xy,h.x);
+                vec3 p1 = vec3(a0.zw,h.y);
+                vec3 p2 = vec3(a1.xy,h.z);
+                vec3 p3 = vec3(a1.zw,h.w);
+                vec4 norm = taylorInvSqrt(vec4(dot(p0,p0), dot(p1,p1), dot(p2, p2), dot(p3,p3)));
+                p0 *= norm.x; p1 *= norm.y; p2 *= norm.z; p3 *= norm.w;
+                vec4 m = max(0.6 - vec4(dot(x0,x0), dot(x1,x1), dot(x2,x2), dot(x3,x3)), 0.0);
+                m = m * m;
+                return 42.0 * dot( m*m, vec4( dot(p0,x0), dot(p1,x1), dot(p2,x2), dot(p3,x3) ) );
+            }
+
+            void main() {
+                vec2 uv = gl_FragCoord.xy / resolution.xy;
+                vec3 pos = texture2D( texturePosition, uv ).xyz;
+                vec3 vel = texture2D( textureVelocity, uv ).xyz;
+
+                // Dampen velocity natively
+                vel *= 0.94;
+
+                // Base Turbulence (Floaty effect)
+                float noiseValX = snoise(vec3(pos.y * 0.5, pos.z * 0.5, time * 0.5));
+                float noiseValY = snoise(vec3(pos.z * 0.5, pos.x * 0.5, time * 0.5));
+                float noiseValZ = snoise(vec3(pos.x * 0.5, pos.y * 0.5, time * 0.5));
+                vel += vec3(noiseValX, noiseValY, noiseValZ) * 0.05;
+
+                // Repulsion / Destruction Logic
+                for(int i = 0; i < ${MAX_TRACKED_POINTS}; i++) {
+                    if (i >= uHandCount) break;
+                    
+                    vec3 hPos = uHands;
+                    vec3 hVel = uHandVels;
+                    vec3 dir = pos - hPos;
+                    float dist = length(dir);
+                    
+                    // Interaction radius
+                    if(dist < 2.5) {
+                        float force = (2.5 - dist) / 2.5;
+                        float handSpeed = length(hVel);
+                        
+                        // If hand moves fast, particles "shatter" with high velocity
+                        // Mix the radial push with the hand's directional swipe
+                        vec3 shatterDir = normalize(dir) + normalize(hVel + vec3(0.01)) * handSpeed * 3.0;
+                        vel += normalize(shatterDir) * force * (1.5 + handSpeed * 15.0);
+                    }
+                }
+
+                // Gravity / Pull back to original spherical shape
+                float distToCenter = length(pos);
+                if(distToCenter > 0.0) {
+                    vec3 pull = -normalize(pos);
+                    // Gentle pull back to a radius of 4
+                    float diff = distToCenter - 4.0;
+                    vel += pull * diff * 0.02; 
+                }
+
+                gl_FragColor = vec4( vel, 1.0 );
+            }
+        `;
+
+        // --- GPGPU SETUP ---
+        const gpuCompute = new GPUComputationRenderer(WIDTH, WIDTH, renderer);
+        const dtPosition = gpuCompute.createTexture();
+        const dtVelocity = gpuCompute.createTexture();
+
+        // Fill initial positions (Spherical Cloud)
+        const posArray = dtPosition.image.data;
+        for (let i = 0; i < posArray.length; i += 4) {
+            // Random distribution inside a sphere
+            const radius = 4.0 * Math.cbrt(Math.random());
+            const theta = Math.random() * 2 * Math.PI;
+            const phi = Math.acos(2 * Math.random() - 1);
+            
+            posArray = radius * Math.sin(phi) * Math.cos(theta);
+            posArray = radius * Math.sin(phi) * Math.sin(theta);
+            posArray = radius * Math.cos(phi);
+            posArray = 1.0;
+        }
+
+        const posVariable = gpuCompute.addVariable("texturePosition", computePositionShader, dtPosition);
+        const velVariable = gpuCompute.addVariable("textureVelocity", computeVelocityShader, dtVelocity);
+
+        gpuCompute.setVariableDependencies(posVariable,);
+        gpuCompute.setVariableDependencies(velVariable,);
+
+        velVariable.material.uniforms.time = { value: 0.0 };
+        velVariable.material.uniforms.uHands = { value: new Array(MAX_TRACKED_POINTS).fill(new THREE.Vector3()) };
+        velVariable.material.uniforms.uHandVels = { value: new Array(MAX_TRACKED_POINTS).fill(new THREE.Vector3()) };
+        velVariable.material.uniforms.uHandCount = { value: 0 };
+
+        const error = gpuCompute.init();
+        if (error !== null) console.error("GPGPU Init Error:", error);
+
+        // --- RENDER PARTICLES ---
+        const particleGeometry = new THREE.BufferGeometry();
+        const uvs = new Float32Array(PARTICLES * 2);
+        for (let i = 0, j = 0; i < WIDTH; i++) {
+            for (let k = 0; k < WIDTH; k++) {
+                uvs = k / (WIDTH - 1);
+                uvs = i / (WIDTH - 1);
+            }
+        }
+        // Store UV coords to map each vertex to a pixel in the FBO texture
+        particleGeometry.setAttribute('position', new THREE.BufferAttribute(uvs, 2));
+
+        const particleMaterial = new THREE.ShaderMaterial({
+            uniforms: {
+                texturePosition: { value: null }
+            },
+            vertexShader: `
+                uniform sampler2D texturePosition;
+                void main() {
+                    vec4 pos = texture2D(texturePosition, position.xy);
+                    vec4 mvPosition = modelViewMatrix * vec4(pos.xyz, 1.0);
+                    
+                    // Perspective scaling for particles
+                    gl_PointSize = (20.0 / -mvPosition.z); 
+                    gl_Position = projectionMatrix * mvPosition;
+                }
+            `,
+            fragmentShader: `
+                void main() {
+                    // Make particles circular with soft edges
+                    vec2 coord = gl_PointCoord - vec2(0.5);
+                    float dist = length(coord);
+                    if(dist > 0.5) discard;
+                    
+                    float alpha = smoothstep(0.5, 0.3, dist);
+                    gl_FragColor = vec4(1.0, 1.0, 1.0, alpha * 0.8);
+                }
+            `,
+            transparent: true,
+            blending: THREE.AdditiveBlending,
+            depthWrite: false
+        });
+
+        const particleMesh = new THREE.Points(particleGeometry, particleMaterial);
+        scene.add(particleMesh);
+
+        // --- HAND INTERACTION GRAPHICS ---
+        const handPoints = [];
+        const handTrails =[];
+        const sphereGeo = new THREE.SphereGeometry(0.2, 16, 16);
+        const sphereMat = new THREE.MeshBasicMaterial({ color: 0xff0044, wireframe: true });
+
+        for (let i = 0; i < MAX_TRACKED_POINTS; i++) {
+            // Hand Spheres (Red)
+            const mesh = new THREE.Mesh(sphereGeo, sphereMat);
+            mesh.visible = false;
+            scene.add(mesh);
+            handPoints.push({ mesh, velocity: new THREE.Vector3(), prevPos: new THREE.Vector3() });
+
+            // Hand Visual Trails (Glowing White Lines)
+            const trailGeo = new THREE.BufferGeometry();
+            const positions = new Float32Array(TRAIL_LENGTH * 3);
+            trailGeo.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+            
+            const trailMat = new THREE.LineBasicMaterial({
+                color: 0xffffff,
+                transparent: true,
+                opacity: 0.6,
+                blending: THREE.AdditiveBlending
+            });
+            const trailLine = new THREE.Line(trailGeo, trailMat);
+            trailLine.visible = false;
+            scene.add(trailLine);
+            
+            handTrails.push({ line: trailLine, positions:[], max: TRAIL_LENGTH });
+        }
+
+        // --- MEDIAPIPE HAND TRACKING ---
+        const videoElement = document.getElementById('webcam');
+        
+        const hands = new Hands({
+            locateFile: (file) => `https://cdn.jsdelivr.net/npm/@mediapipe/hands/${file}`
+        });
+        
+        hands.setOptions({
+            maxNumHands: 2,
+            modelComplexity: 1, // 1 is optimal for phones/web
+            minDetectionConfidence: 0.6,
+            minTrackingConfidence: 0.6
+        });
+
+        let currentActiveHands = 0;
+        let mappedPositions =[];
+
+        hands.onResults((results) => {
+            document.getElementById('ui').style.opacity = '0'; // Hide loading UI
+            
+            mappedPositions =[];
+            currentActiveHands = 0;
+
+            if (results.multiHandLandmarks) {
+                const aspect = window.innerWidth / window.innerHeight;
+                
+                results.multiHandLandmarks.forEach((landmarks) => {
+                    // Extract Index finger tip (8) and Thumb tip (4)
+                    const pointsOfInterest =, landmarks]; 
+
+                    pointsOfInterest.forEach(landmark => {
+                        if (currentActiveHands >= MAX_TRACKED_POINTS) return;
+
+                        // Map Normalized bounds to Three.js 3D space
+                        // We mirror the X axis because front cameras act like mirrors
+                        const x = -(landmark.x - 0.5) * 16 * aspect; 
+                        const y = -(landmark.y - 0.5) * 16;
+                        const z = -landmark.z * 15; // depth
+
+                        mappedPositions.push(new THREE.Vector3(x, y, z));
+                        currentActiveHands++;
+                    });
+                });
+            }
+        });
+
+        // Start Mobile-Friendly Webcam Loop
+        navigator.mediaDevices.getUserMedia({ 
+            video: { facingMode: 'user', width: { ideal: 640 }, height: { ideal: 480 } } 
+        }).then((stream) => {
+            videoElement.srcObject = stream;
+            videoElement.play();
+            
+            const processFrame = async () => {
+                if(!videoElement.paused && !videoElement.ended) {
+                    await hands.send({ image: videoElement });
+                }
+                requestAnimationFrame(processFrame);
+            };
+            processFrame();
+            
+        }).catch(err => {
+            document.getElementById('status-text').innerHTML = "Camera access denied.<br>Webcam tracking requires secure context (HTTPS/Localhost).";
+            console.error("Camera Error: ", err);
+        });
+
+        // --- ANIMATION LOOP ---
+        const clock = new THREE.Clock();
+
+        function animate() {
+            requestAnimationFrame(animate);
+            const delta = clock.getDelta();
+            const elapsedTime = clock.getElapsedTime();
+
+            // 1. Update Hand Visuals and Velocity Calculations
+            const shaderHands =[];
+            const shaderVels =[];
+
+            for (let i = 0; i < MAX_TRACKED_POINTS; i++) {
+                const pointData = handPoints;
+                const trailData = handTrails;
+
+                if (i < currentActiveHands) {
+                    const targetPos = mappedPositions;
+                    
+                    // Calculate hand velocity for "shatter" physics
+                    pointData.velocity.subVectors(targetPos, pointData.prevPos).divideScalar(delta || 0.016);
+                    pointData.prevPos.copy(targetPos);
+
+                    // Smooth mesh positioning via lerp
+                    pointData.mesh.position.lerp(targetPos, 0.4);
+                    pointData.mesh.visible = true;
+
+                    // Populate shader uniform arrays
+                    shaderHands.push(pointData.mesh.position.clone());
+                    shaderVels.push(pointData.velocity.clone());
+
+                    // Update Trails
+                    trailData.positions.unshift(pointData.mesh.position.clone());
+                    if (trailData.positions.length > trailData.max) trailData.positions.pop();
+                    
+                    const posArray = trailData.line.geometry.attributes.position.array;
+                    for (let j = 0; j < trailData.positions.length; j++) {
+                        posArray = trailData.positions.x;
+                        posArray = trailData.positions.y;
+                        posArray = trailData.positions.z;
+                    }
+                    trailData.line.geometry.attributes.position.needsUpdate = true;
+                    // Fading logic for line drawing (hide inactive parts of the array)
+                    trailData.line.geometry.setDrawRange(0, trailData.positions.length);
+                    trailData.line.visible = true;
+
+                } else {
+                    // Hide unused hands/trails
+                    pointData.mesh.visible = false;
+                    shaderHands.push(new THREE.Vector3(999, 999, 999)); // Push far away
+                    shaderVels.push(new THREE.Vector3(0, 0, 0));
+                    
+                    // Shrink trails gently
+                    if(trailData.positions.length > 0) {
+                        trailData.positions.pop();
+                        trailData.line.geometry.setDrawRange(0, trailData.positions.length);
+                    } else {
+                        trailData.line.visible = false;
+                    }
+                }
+            }
+
+            // 2. Update GPGPU Uniforms
+            velVariable.material.uniforms.time.value = elapsedTime;
+            velVariable.material.uniforms.uHandCount.value = currentActiveHands;
+            if(currentActiveHands > 0) {
+                velVariable.material.uniforms.uHands.value = shaderHands;
+                velVariable.material.uniforms.uHandVels.value = shaderVels;
+            }
+
+            // 3. Compute Particle Physics (GPGPU)
+            gpuCompute.compute();
+
+            // 4. Send updated FBO positions to Particle Material
+            particleMaterial.uniforms.texturePosition.value = gpuCompute.getCurrentRenderTarget(posVariable).texture;
+
+            // Slowly rotate scene for ambiance
+            scene.rotation.y = Math.sin(elapsedTime * 0.1) * 0.2;
+            scene.rotation.x = Math.cos(elapsedTime * 0.1) * 0.1;
+
+            renderer.render(scene, camera);
+        }
+
+        animate();
+
+        // --- WINDOW RESIZE (Responsive) ---
+        window.addEventListener('resize', () => {
+            camera.aspect = window.innerWidth / window.innerHeight;
+            camera.updateProjectionMatrix();
+            renderer.setSize(window.innerWidth, window.innerHeight);
+        });
+    </script>
+</body>
+</html>
